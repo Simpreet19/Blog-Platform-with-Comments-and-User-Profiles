@@ -1,0 +1,802 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, onSnapshot, serverTimestamp, where, addDoc, deleteDoc, updateDoc, getDocs } from 'firebase/firestore';
+import { Home, Notebook, User, LogOut, Loader, Plus, MessageSquare, Edit, Trash2, ArrowLeft } from 'lucide-react';
+
+// --- Global Constants and Firebase Setup ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Ensure Firebase is initialized only once
+let app, db, auth;
+if (Object.keys(firebaseConfig).length > 0) {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+} else {
+    console.error("Firebase config is missing. The application will not function correctly.");
+}
+
+// --- Utility Functions ---
+
+/**
+ * Formats a Firestore Timestamp or Date object into a readable string.
+ * @param {object} timestamp - Firestore Timestamp object.
+ * @returns {string} Formatted date string.
+ */
+const formatDate = (timestamp) => {
+    if (!timestamp) return 'N/A';
+    // If it's a Firestore Timestamp, convert to Date first
+    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+    return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+    });
+};
+
+// --- Custom Hooks for Firestore Data ---
+
+/**
+ * Custom hook to listen to a collection and manage state.
+ * @param {string} collectionName - The name of the collection (e.g., 'posts').
+ * @param {string} orderByField - Field to order by.
+ * @param {Array<object>} queryConstraints - Additional query constraints (e.g., where clauses).
+ * @returns {Array} List of documents.
+ */
+const useFirestoreCollection = (collectionName, orderByField, queryConstraints = []) => {
+    const [data, setData] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+
+    useEffect(() => {
+        if (!db) {
+            setIsLoading(false);
+            return;
+        }
+
+        // Collection path uses the public data structure for shared data
+        const baseRef = collection(db, `artifacts/${appId}/public/data/${collectionName}`);
+        let q = query(baseRef, ...queryConstraints, orderBy(orderByField, 'desc'));
+
+        setIsLoading(true);
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const list = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+            }));
+            setData(list);
+            setIsLoading(false);
+        }, (error) => {
+            console.error(`Error fetching ${collectionName}:`, error);
+            setIsLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [collectionName, orderByField, queryConstraints]); // queryConstraints needs to be stable
+
+    return data;
+};
+
+
+// --- Core Components ---
+
+// --- 1. Post List View ---
+
+const PostCard = React.memo(({ post, currentUserId, onSelectPost, onEditPost, onDeletePost }) => {
+    const isOwner = post.authorId === currentUserId;
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg hover:shadow-xl transition-shadow duration-300 border border-gray-100 flex flex-col">
+            <h2
+                className="text-2xl font-bold text-gray-800 mb-2 cursor-pointer hover:text-indigo-600 transition-colors"
+                onClick={() => onSelectPost(post.id)}
+            >
+                {post.title}
+            </h2>
+            <div className="text-sm text-gray-500 mb-4 flex items-center space-x-2">
+                <User className="w-4 h-4" />
+                <span className="font-medium text-indigo-500">{post.authorUsername}</span>
+                <span className="text-gray-400">|</span>
+                <Notebook className="w-4 h-4" />
+                <span>{formatDate(post.createdAt)}</span>
+            </div>
+            <p className="text-gray-700 flex-grow mb-4 line-clamp-3">
+                {post.content.substring(0, 150)}{post.content.length > 150 ? '...' : ''}
+            </p>
+            <div className="flex justify-between items-center pt-4 border-t border-gray-100">
+                <button
+                    onClick={() => onSelectPost(post.id)}
+                    className="flex items-center text-sm font-semibold text-indigo-600 hover:text-indigo-700 transition-colors"
+                >
+                    <MessageSquare className="w-4 h-4 mr-1" />
+                    Read & Comment
+                </button>
+                {isOwner && (
+                    <div className="flex space-x-2">
+                        <button
+                            onClick={() => onEditPost(post.id)}
+                            className="p-2 text-sm text-yellow-600 hover:text-yellow-700 bg-yellow-50/50 rounded-full transition-colors"
+                            title="Edit Post"
+                        >
+                            <Edit className="w-4 h-4" />
+                        </button>
+                        <button
+                            onClick={() => onDeletePost(post.id)}
+                            className="p-2 text-sm text-red-600 hover:text-red-700 bg-red-50/50 rounded-full transition-colors"
+                            title="Delete Post"
+                        >
+                            <Trash2 className="w-4 h-4" />
+                        </button>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+});
+
+const HomePage = ({ posts, currentUserId, setView, setSelectedPostId, onEditPost, onDeletePost }) => (
+    <div className="space-y-8 p-4 sm:p-6 lg:p-8">
+        <div className="flex justify-between items-center border-b border-indigo-100 pb-4">
+            <h1 className="text-3xl font-extrabold text-gray-900">Latest Blog Posts</h1>
+            <button
+                onClick={() => setView('createPost')}
+                className="flex items-center px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition-colors"
+            >
+                <Plus className="w-5 h-5 mr-2" />
+                New Post
+            </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+            {posts.length === 0 ? (
+                <div className="col-span-full text-center py-12 text-gray-500">
+                    <p className="text-lg">No posts yet. Be the first to write one!</p>
+                </div>
+            ) : (
+                posts.map(post => (
+                    <PostCard
+                        key={post.id}
+                        post={post}
+                        currentUserId={currentUserId}
+                        onSelectPost={setSelectedPostId}
+                        onEditPost={onEditPost}
+                        onDeletePost={onDeletePost}
+                    />
+                ))
+            )}
+        </div>
+    </div>
+);
+
+// --- 2. Post Detail View with Real-time Comments ---
+
+const CommentSection = ({ postId, currentUserId, currentUsername }) => {
+    // Fetch comments specific to this postId, ordered by creation time
+    const comments = useFirestoreCollection('comments', 'createdAt', useMemo(() => [where('postId', '==', postId)], [postId]));
+    const [newComment, setNewComment] = useState('');
+
+    const handleSubmitComment = async (e) => {
+        e.preventDefault();
+        if (!newComment.trim()) return;
+
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/public/data/comments`), {
+                postId,
+                authorId: currentUserId,
+                authorUsername: currentUsername,
+                content: newComment.trim(),
+                createdAt: serverTimestamp(),
+            });
+            setNewComment('');
+        } catch (e) {
+            console.error("Error adding comment: ", e);
+        }
+    };
+
+    return (
+        <div className="mt-8">
+            <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Comments ({comments.length})</h3>
+
+            {/* Comment Form */}
+            <form onSubmit={handleSubmitComment} className="mb-8 p-4 bg-gray-50 rounded-lg shadow-inner">
+                <textarea
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition-colors"
+                    rows="3"
+                    placeholder="Write your comment here..."
+                    value={newComment}
+                    onChange={(e) => setNewComment(e.target.value)}
+                    required
+                ></textarea>
+                <button
+                    type="submit"
+                    className="mt-3 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition-colors"
+                >
+                    Add Comment
+                </button>
+            </form>
+
+            {/* Comment List */}
+            <div className="space-y-4">
+                {comments.length === 0 ? (
+                    <p className="text-gray-500 italic">No comments yet. Be the first to share your thoughts!</p>
+                ) : (
+                    comments.map(comment => (
+                        <div key={comment.id} className="bg-white p-4 rounded-lg shadow-sm border border-gray-100">
+                            <div className="flex justify-between items-start mb-2">
+                                <span className="font-semibold text-indigo-600">{comment.authorUsername}</span>
+                                <span className="text-xs text-gray-400">{formatDate(comment.createdAt)}</span>
+                            </div>
+                            <p className="text-gray-700">{comment.content}</p>
+                        </div>
+                    ))
+                )}
+            </div>
+        </div>
+    );
+};
+
+
+const PostDetail = ({ postId, posts, currentUserId, currentUsername, setView }) => {
+    const post = posts.find(p => p.id === postId);
+
+    if (!post) {
+        return (
+            <div className="p-8 text-center">
+                <p className="text-lg text-red-500">Post not found.</p>
+                <button
+                    onClick={() => setView('home')}
+                    className="mt-4 flex items-center mx-auto text-indigo-600 hover:text-indigo-700"
+                >
+                    <ArrowLeft className="w-5 h-5 mr-1" /> Back to Home
+                </button>
+            </div>
+        );
+    }
+
+    return (
+        <div className="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+            <button
+                onClick={() => setView('home')}
+                className="flex items-center text-indigo-600 hover:text-indigo-700 mb-6 font-medium transition-colors"
+            >
+                <ArrowLeft className="w-5 h-5 mr-2" /> Back to All Posts
+            </button>
+
+            <article className="bg-white p-8 rounded-xl shadow-2xl border border-indigo-100">
+                <h1 className="text-4xl font-extrabold text-gray-900 mb-3">{post.title}</h1>
+                <div className="flex items-center space-x-3 text-gray-500 mb-6 border-b pb-4">
+                    <User className="w-5 h-5" />
+                    <span className="font-medium text-indigo-500">By {post.authorUsername}</span>
+                    <span className="text-gray-400">•</span>
+                    <Notebook className="w-5 h-5" />
+                    <time dateTime={post.createdAt ? post.createdAt.toDate().toISOString() : ''}>{formatDate(post.createdAt)}</time>
+                </div>
+
+                <div className="prose max-w-none text-lg text-gray-700 leading-relaxed whitespace-pre-wrap">
+                    {post.content}
+                </div>
+
+                {/* Real-time Comments Section */}
+                <CommentSection
+                    postId={postId}
+                    currentUserId={currentUserId}
+                    currentUsername={currentUsername}
+                />
+            </article>
+        </div>
+    );
+};
+
+// --- 3. Post CRUD Form (Create/Edit) ---
+
+const PostForm = ({ currentUserId, currentUsername, setView, postIdToEdit, posts, setPostIdToEdit }) => {
+    const isEditing = !!postIdToEdit;
+    const existingPost = isEditing ? posts.find(p => p.id === postIdToEdit) : null;
+
+    const [title, setTitle] = useState(existingPost?.title || '');
+    const [content, setContent] = useState(existingPost?.content || '');
+    const [isSaving, setIsSaving] = useState(false);
+
+    const handleSave = async (e) => {
+        e.preventDefault();
+        if (!title.trim() || !content.trim()) return;
+
+        setIsSaving(true);
+        const postData = {
+            title: title.trim(),
+            content: content.trim(),
+            updatedAt: serverTimestamp(),
+        };
+
+        try {
+            if (isEditing && existingPost) {
+                // Update Post
+                const postRef = doc(db, `artifacts/${appId}/public/data/posts`, postIdToEdit);
+                await updateDoc(postRef, postData);
+                // NOTE: Using a custom modal/notification is preferred over alert()
+                alert('Post updated successfully!');
+            } else {
+                // Create New Post
+                const newPostData = {
+                    ...postData,
+                    authorId: currentUserId,
+                    authorUsername: currentUsername,
+                    createdAt: serverTimestamp(),
+                };
+                await addDoc(collection(db, `artifacts/${appId}/public/data/posts`), newPostData);
+                // NOTE: Using a custom modal/notification is preferred over alert()
+                alert('Post created successfully!');
+            }
+            setTitle('');
+            setContent('');
+            setPostIdToEdit(null); // Clear edit state
+            setView('home');
+        } catch (e) {
+            console.error("Error saving post: ", e);
+            // NOTE: Using a custom modal/notification is preferred over alert()
+            alert(`Error: Could not save post. ${e.message}`);
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    return (
+        <div className="max-w-3xl mx-auto p-4 sm:p-6 lg:p-8">
+            <h1 className="text-3xl font-bold text-gray-900 mb-6 border-b pb-3">
+                {isEditing ? 'Edit Post' : 'Create New Post'}
+            </h1>
+            <form onSubmit={handleSave} className="bg-white p-6 rounded-xl shadow-lg space-y-4">
+                <div>
+                    <label htmlFor="title" className="block text-sm font-medium text-gray-700 mb-1">Title</label>
+                    <input
+                        type="text"
+                        id="title"
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                        placeholder="A catchy title..."
+                        required
+                    />
+                </div>
+                <div>
+                    <label htmlFor="content" className="block text-sm font-medium text-gray-700 mb-1">Content</label>
+                    <textarea
+                        id="content"
+                        rows="15"
+                        value={content}
+                        onChange={(e) => setContent(e.target.value)}
+                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                        placeholder="Write your amazing content here..."
+                        required
+                    />
+                </div>
+                <div className="flex justify-end space-x-3">
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setPostIdToEdit(null);
+                            setView('home');
+                        }}
+                        className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+                        disabled={isSaving}
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        className="flex items-center px-6 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition-colors disabled:opacity-50"
+                        disabled={isSaving || !title.trim() || !content.trim()}
+                    >
+                        {isSaving ? <Loader className="w-5 h-5 animate-spin mr-2" /> : null}
+                        {isEditing ? 'Update Post' : 'Publish Post'}
+                    </button>
+                </div>
+            </form>
+        </div>
+    );
+};
+
+// --- 4. User Profile Management ---
+
+const ProfileView = ({ userProfile, userId, setView, onUpdateProfile, onSignOut }) => {
+    const [isEditing, setIsEditing] = useState(false);
+    const [username, setUsername] = useState(userProfile?.username || '');
+    const [bio, setBio] = useState(userProfile?.bio || '');
+    const [isSaving, setIsSaving] = useState(false);
+
+    useEffect(() => {
+        if (userProfile) {
+            setUsername(userProfile.username || '');
+            setBio(userProfile.bio || '');
+        }
+    }, [userProfile]);
+
+    const handleSaveProfile = async (e) => {
+        e.preventDefault();
+        if (!username.trim()) return;
+
+        setIsSaving(true);
+        try {
+            await onUpdateProfile(userId, username.trim(), bio.trim());
+            // NOTE: Using a custom modal/notification is preferred over alert()
+            alert('Profile updated successfully!');
+            setIsEditing(false);
+        } catch (e) {
+            console.error("Error updating profile:", e);
+            // NOTE: Using a custom modal/notification is preferred over alert()
+            alert('Could not save profile. Username might be taken.');
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    if (!userProfile || isEditing || !userProfile.username) {
+        return (
+            <div className="max-w-2xl mx-auto p-4 sm:p-6 lg:p-8">
+                <h1 className="text-3xl font-bold text-gray-900 mb-6 border-b pb-3">
+                    {userProfile?.username ? 'Edit Profile' : 'Complete Your Profile'}
+                </h1>
+                <form onSubmit={handleSaveProfile} className="bg-white p-6 rounded-xl shadow-lg space-y-4">
+                    <p className="text-sm text-gray-500">Your unique User ID: <span className="font-mono text-xs p-1 bg-gray-100 rounded">{userId}</span></p>
+                    <div>
+                        <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">Username (Required)</label>
+                        <input
+                            type="text"
+                            id="username"
+                            value={username}
+                            onChange={(e) => setUsername(e.target.value.replace(/\s/g, ''))} // No spaces in username
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            placeholder="A unique display name (no spaces)"
+                            required
+                            disabled={isSaving}
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="bio" className="block text-sm font-medium text-gray-700 mb-1">Bio</label>
+                        <textarea
+                            id="bio"
+                            rows="4"
+                            value={bio}
+                            onChange={(e) => setBio(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            placeholder="Tell the world about yourself..."
+                            disabled={isSaving}
+                        />
+                    </div>
+                    <div className="flex justify-end space-x-3 pt-2">
+                        {userProfile?.username && (
+                            <button
+                                type="button"
+                                onClick={() => setIsEditing(false)}
+                                className="px-4 py-2 text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+                                disabled={isSaving}
+                            >
+                                Cancel
+                            </button>
+                        )}
+                        <button
+                            type="submit"
+                            className="flex items-center px-6 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition-colors disabled:opacity-50"
+                            disabled={isSaving || !username.trim()}
+                        >
+                            {isSaving ? <Loader className="w-5 h-5 animate-spin mr-2" /> : null}
+                            {userProfile?.username ? 'Save Changes' : 'Create Profile'}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        );
+    }
+
+    // Read-only Profile View
+    return (
+        <div className="max-w-2xl mx-auto p-4 sm:p-6 lg:p-8">
+            <div className="bg-white p-8 rounded-xl shadow-2xl border border-indigo-100">
+                <div className="flex justify-between items-start mb-6 border-b pb-4">
+                    <h1 className="text-3xl font-bold text-gray-900">{userProfile.username}'s Profile</h1>
+                    <button
+                        onClick={() => setIsEditing(true)}
+                        className="flex items-center px-3 py-1 text-sm bg-yellow-500 text-white rounded-full hover:bg-yellow-600 transition-colors"
+                    >
+                        <Edit className="w-4 h-4 mr-1" /> Edit
+                    </button>
+                </div>
+
+                <div className="space-y-4 text-lg">
+                    <div className="flex items-center space-x-3">
+                        <User className="w-6 h-6 text-indigo-500" />
+                        <span className="font-semibold text-gray-700">Display Name:</span>
+                        <span className="text-gray-800">{userProfile.username}</span>
+                    </div>
+
+                    <div className="border-t pt-4">
+                        <p className="font-semibold text-gray-700 mb-2">Bio:</p>
+                        <p className="text-gray-600 italic whitespace-pre-wrap">{userProfile.bio || 'No bio provided.'}</p>
+                    </div>
+
+                    <div className="text-sm text-gray-500 border-t pt-4">
+                        <p>User ID: <span className="font-mono text-xs bg-gray-100 p-1 rounded">{userId}</span></p>
+                        <p>Joined: {formatDate(userProfile.createdAt)}</p>
+                    </div>
+                </div>
+
+                <button
+                    onClick={onSignOut}
+                    className="mt-8 flex items-center px-4 py-2 bg-red-600 text-white font-semibold rounded-lg hover:bg-red-700 transition-colors"
+                >
+                    <LogOut className="w-5 h-5 mr-2" /> Sign Out
+                </button>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Main App Component ---
+
+const App = () => {
+    // Firebase and Auth States
+    const [userId, setUserId] = useState(null);
+    const [userProfile, setUserProfile] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [loading, setLoading] = useState(true);
+
+    // App Navigation and Data States
+    const [view, setView] = useState('home'); // 'home', 'createPost', 'postDetail', 'profile'
+    const [selectedPostId, setSelectedPostId] = useState(null);
+    const [postIdToEdit, setPostIdToEdit] = useState(null);
+
+    // Fetching Data (Cached)
+    const posts = useFirestoreCollection('posts', 'createdAt');
+    const users = useFirestoreCollection('users', 'createdAt'); // Fetching all users to check for unique usernames
+
+    // 1. Firebase Initialization and Authentication
+    useEffect(() => {
+        if (!auth || !db) {
+            setLoading(false);
+            return;
+        }
+
+        const setupAuth = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase auth error:", error);
+            }
+        };
+
+        const unsubscribe = onAuthStateChanged(auth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+                setIsAuthReady(true);
+            } else {
+                setUserId(null);
+                setUserProfile(null);
+                setIsAuthReady(true);
+            }
+            setLoading(false);
+        });
+
+        setupAuth();
+        return () => unsubscribe();
+    }, []);
+
+    // 2. User Profile Listener
+    useEffect(() => {
+        if (db && userId) {
+            const userRef = doc(db, `artifacts/${appId}/public/data/users`, userId);
+
+            const unsubscribe = onSnapshot(userRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    setUserProfile({ id: docSnap.id, ...docSnap.data() });
+                } else {
+                    // Force profile creation/completion if user exists but profile doc does not
+                    setUserProfile(null);
+                    setView('profile');
+                }
+            }, (error) => {
+                console.error("Error fetching user profile:", error);
+            });
+
+            return () => unsubscribe();
+        }
+    }, [db, userId]);
+
+    // 3. Navigation Handlers
+    const handleSelectPost = useCallback((postId) => {
+        setSelectedPostId(postId);
+        setView('postDetail');
+    }, []);
+
+    const handleEditPost = useCallback((postId) => {
+        setPostIdToEdit(postId);
+        setView('createPost');
+    }, []);
+
+    const handleDeletePost = useCallback(async (postId) => {
+        // NOTE: Using a custom modal/notification is preferred over window.confirm()
+        if (window.confirm('Are you sure you want to delete this post? This cannot be undone.')) {
+            try {
+                // Delete Post
+                await deleteDoc(doc(db, `artifacts/${appId}/public/data/posts`, postId));
+
+                // Optional: Delete related comments (highly recommended for data hygiene)
+                const commentsRef = collection(db, `artifacts/${appId}/public/data/comments`);
+                // Query for all comments belonging to this post
+                const q = query(commentsRef, where('postId', '==', postId));
+                const snapshot = await getDocs(q);
+                // Batch delete or simply loop and delete
+                snapshot.forEach((commentDoc) => {
+                    deleteDoc(commentDoc.ref);
+                });
+
+                // NOTE: Using a custom modal/notification is preferred over alert()
+                alert('Post and associated comments deleted.');
+            } catch (e) {
+                console.error("Error deleting post:", e);
+                // NOTE: Using a custom modal/notification is preferred over alert()
+                alert('Could not delete post.');
+            }
+        }
+    }, []);
+
+    const handleUpdateProfile = async (id, username, bio) => {
+        const userRef = doc(db, `artifacts/${appId}/public/data/users`, id);
+
+        // Check if username is already taken by another user
+        const existingUser = users.find(u => u.username === username && u.id !== id);
+        if (existingUser) {
+            throw new Error('Username already taken.');
+        }
+
+        const profileData = {
+            username,
+            bio,
+            updatedAt: serverTimestamp(),
+            // Only set createdAt on initial creation
+            ...(userProfile === null && { createdAt: serverTimestamp() })
+        };
+
+        await setDoc(userRef, profileData, { merge: true });
+        // The onSnapshot listener will update userProfile state
+    };
+
+    const handleSignOut = () => {
+        if (auth) {
+            signOut(auth).then(() => {
+                setUserId(null);
+                setUserProfile(null);
+                setView('home'); // Go back to home after sign out
+                // Re-authenticate anonymously to keep the app functional
+                signInAnonymously(auth);
+            }).catch(e => {
+                console.error("Sign out error:", e);
+            });
+        }
+    };
+
+    // --- Conditional Rendering for Main Content ---
+
+    const renderContent = () => {
+        if (loading || !isAuthReady) {
+            return (
+                <div className="flex justify-center items-center h-full min-h-[50vh]">
+                    <Loader className="w-10 h-10 animate-spin text-indigo-500" />
+                    <p className="ml-3 text-lg text-gray-600">Loading Application...</p>
+                </div>
+            );
+        }
+
+        // If authenticated but profile is missing, force profile view
+        if (userId && !userProfile && view !== 'profile') {
+            return <ProfileView userId={userId} userProfile={userProfile} setView={setView} onUpdateProfile={handleUpdateProfile} onSignOut={handleSignOut} />;
+        }
+
+        switch (view) {
+            case 'home':
+                return (
+                    <HomePage
+                        posts={posts}
+                        currentUserId={userId}
+                        setView={setView}
+                        setSelectedPostId={handleSelectPost}
+                        onEditPost={handleEditPost}
+                        onDeletePost={handleDeletePost}
+                    />
+                );
+            case 'createPost':
+                return (
+                    <PostForm
+                        currentUserId={userId}
+                        currentUsername={userProfile?.username || 'Anonymous'}
+                        setView={setView}
+                        postIdToEdit={postIdToEdit}
+                        posts={posts}
+                        setPostIdToEdit={setPostIdToEdit}
+                    />
+                );
+            case 'postDetail':
+                return (
+                    <PostDetail
+                        postId={selectedPostId}
+                        posts={posts}
+                        currentUserId={userId}
+                        currentUsername={userProfile?.username || 'Anonymous'}
+                        setView={setView}
+                    />
+                );
+            case 'profile':
+                return (
+                    <ProfileView
+                        userId={userId}
+                        userProfile={userProfile}
+                        setView={setView}
+                        onUpdateProfile={handleUpdateProfile}
+                        onSignOut={handleSignOut}
+                    />
+                );
+            default:
+                return <HomePage posts={posts} currentUserId={userId} setView={setView} setSelectedPostId={handleSelectPost} onEditPost={handleEditPost} onDeletePost={handleDeletePost} />;
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-50 font-sans">
+            {/* Header / Navbar */}
+            <header className="bg-white shadow-md sticky top-0 z-10">
+                <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                    <div
+                        className="text-2xl font-extrabold text-indigo-600 cursor-pointer"
+                        onClick={() => { setView('home'); setSelectedPostId(null); setPostIdToEdit(null); }}
+                    >
+                        Gemini Blog
+                    </div>
+
+                    <nav className="flex space-x-4 items-center">
+                        <button
+                            onClick={() => { setView('home'); setSelectedPostId(null); setPostIdToEdit(null); }}
+                            className={`p-2 rounded-lg transition-colors flex items-center ${view === 'home' ? 'bg-indigo-100 text-indigo-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                            title="Home"
+                        >
+                            <Home className="w-5 h-5 mr-1 sm:mr-0" />
+                            <span className="sm:hidden ml-1">Home</span>
+                        </button>
+                        {userProfile?.username && (
+                            <button
+                                onClick={() => setView('profile')}
+                                className={`p-2 rounded-lg transition-colors flex items-center ${view === 'profile' ? 'bg-indigo-100 text-indigo-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                                title="Profile"
+                            >
+                                <User className="w-5 h-5 mr-1 sm:mr-0" />
+                                <span className="hidden sm:inline-block ml-2 font-semibold">{userProfile.username}</span>
+                            </button>
+                        )}
+                        {userProfile?.username && (
+                            <button
+                                onClick={handleSignOut}
+                                className="p-2 rounded-lg text-red-500 hover:bg-red-50 transition-colors"
+                                title="Sign Out"
+                            >
+                                <LogOut className="w-5 h-5" />
+                            </button>
+                        )}
+                    </nav>
+                </div>
+            </header>
+
+            {/* Main Content Area */}
+            <main className="max-w-6xl mx-auto pb-12">
+                {renderContent()}
+            </main>
+        </div>
+    );
+};
+
+// Export App as default, assuming a standard React setup environment
+export default App;
